@@ -60,8 +60,11 @@ public class TerrainGenerator : MonoBehaviour
 
     private int seed;
 
-    // flat 3D array storing the voxel type at each grid position
-    private byte[,,] voxels;
+    public VoxelGrid Grid { get; private set; }
+
+    // Exposed for external systems (brush, chunk manager)
+    public float CellSize   => cellSize;
+    public byte  WaterTypeId => waterType != null ? waterType.id : (byte)0;
 
     // FaceVertices defines the 4 corners of each face on a unit cube [0,1].
     // Vertices are in CCW order when viewed from outside, so Unity's back-face
@@ -145,11 +148,13 @@ public class TerrainGenerator : MonoBehaviour
 
     private void BuildVoxels()
     {
-        voxels = new byte[gridSizeX, maxHeight + 1, gridSizeZ];
+        Grid = new VoxelGrid(gridSizeX, maxHeight, gridSizeZ);
 
         // seed shifts the noise sampling origin so each seed produces a unique world
         float2 seedOffset = new float2(seed, seed * 0.5f);
         int waterHeightInt = Mathf.RoundToInt(waterLevel * maxHeight);
+        int sandMaxY = Mathf.Min(waterHeightInt + sandRange, maxHeight);
+        int stoneMaxY = sandMaxY + stoneDepth;
 
         // Pre-compute continental values so we can normalize their distribution.
         // Without this, the noise can land in a region that's mostly high or mostly low
@@ -171,50 +176,55 @@ public class TerrainGenerator : MonoBehaviour
         float continentalShift = 0.5f - (continentalSum / (gridSizeX * gridSizeZ));
 
         for (int z = 0; z < gridSizeZ; z++)
+        for (int x = 0; x < gridSizeX; x++)
         {
-            for (int x = 0; x < gridSizeX; x++)
-            {
-                // dividing by scale instead of normalizing by grid size ensures
-                // the noise pattern doesn't compress when the grid grows (it extends)
-                float2 detailPos = new float2(
-                    x * cellSize / noiseScale + noiseOffset.x + seedOffset.x,
-                    z * cellSize / noiseScale + noiseOffset.y + seedOffset.y
-                );
+            // dividing by scale instead of normalizing by grid size ensures
+            // the noise pattern doesn't compress when the grid grows (it extends)
+            float2 detailPos = new float2(
+                x * cellSize / noiseScale + noiseOffset.x + seedOffset.x,
+                z * cellSize / noiseScale + noiseOffset.y + seedOffset.y
+            );
 
-                float detail = math.pow(SampleNoise(detailPos, noiseType), resultPow);
-                float continental = Mathf.Clamp01(continentalRaw[x, z] + continentalShift);
-                // S-curve contrast: values below 0.5 are pushed toward 0, above 0.5 toward 1
-                continental = continental < 0.5f
-                    ? 0.5f * Mathf.Pow(2f * continental, continentalContrast)
-                    : 1f - 0.5f * Mathf.Pow(2f * (1f - continental), continentalContrast);
+            float detail = math.pow(SampleNoise(detailPos, noiseType), resultPow);
+            float continental = Mathf.Clamp01(continentalRaw[x, z] + continentalShift);
+            // S-curve contrast: values below 0.5 are pushed toward 0, above 0.5 toward 1
+            continental = continental < 0.5f
+                ? 0.5f * Mathf.Pow(2f * continental, continentalContrast)
+                : 1f - 0.5f * Mathf.Pow(2f * (1f - continental), continentalContrast);
 
-                // multiplying both noises creates a continental mask: detail noise can only
-                // produce mountains where the continental noise is high, leaving flat plains elsewhere
-                int terrainHeight = Mathf.Max(1, Mathf.RoundToInt(detail * continental * maxHeight));
-
-                int sandMaxY  = Mathf.Min(waterHeightInt + sandRange, maxHeight);
-                // stone rises stoneDepth blocks above the sand/waterline; grass sits on top
-                int stoneMaxY = sandMaxY + stoneDepth;
-
-                for (int y = 0; y < terrainHeight && y <= maxHeight; y++)
-                {
-                    if (y <= sandMaxY)
-                        voxels[x, y, z] = sandType.id;   // sand near the waterline
-                    else if (y <= stoneMaxY)
-                        voxels[x, y, z] = stoneType.id;  // stone band above sand
-                    else
-                        voxels[x, y, z] = grassType.id;  // grass near the surface
-                }
-
-                // water fills the gap between terrain and the fixed water level,
-                // so low-lying areas become lakes rather than empty air
-                if (terrainHeight <= waterHeightInt)
-                {
-                    for (int y = terrainHeight; y <= waterHeightInt && y <= maxHeight; y++)
-                        voxels[x, y, z] = waterType.id;
-                }
-            }
+            // multiplying both noises creates a continental mask: detail noise can only
+            // produce mountains where the continental noise is high, leaving flat plains elsewhere
+            int terrainHeight = Mathf.Max(1, Mathf.RoundToInt(detail * continental * maxHeight));
+            FillColumn(x, z, terrainHeight, waterHeightInt, sandMaxY, stoneMaxY);
         }
+    }
+
+    // Writes voxel types into a single column based on height and terrain rules.
+    private void FillColumn(int x, int z, int terrainHeight, int waterHeightInt, int sandMaxY, int stoneMaxY)
+    {
+        Grid.ClearColumn(x, z);
+
+        for (int y = 0; y < terrainHeight && y <= maxHeight; y++)
+        {
+            if (y <= sandMaxY) Grid.Set(x, y, z, sandType.id);   // sand near waterline
+            else if (y <= stoneMaxY) Grid.Set(x, y, z, stoneType.id);  // stone band above sand
+            else Grid.Set(x, y, z, grassType.id);  // grass near the surface
+        }
+
+        // water fills the gap between terrain and the fixed water level
+        if (terrainHeight <= waterHeightInt)
+            for (int y = terrainHeight; y <= waterHeightInt && y <= maxHeight; y++)
+                Grid.Set(x, y, z, waterType.id);
+    }
+
+    // Reapplies voxel type assignment to one column at the given height.
+    // Called by the brush after modifying terrain height.
+    public void ApplyColumn(int x, int z, int terrainHeight)
+    {
+        int waterHeightInt = Mathf.RoundToInt(waterLevel * maxHeight);
+        int sandMaxY = Mathf.Min(waterHeightInt + sandRange, maxHeight);
+        int stoneMaxY = sandMaxY + stoneDepth;
+        FillColumn(x, z, terrainHeight, waterHeightInt, sandMaxY, stoneMaxY);
     }
 
     private void BuildSurfaceMesh()
@@ -230,12 +240,12 @@ public class TerrainGenerator : MonoBehaviour
             // scan downward to find the highest solid, non-water block
             for (int y = maxHeight; y >= 0; y--)
             {
-                byte v = voxels[x, y, z];
+                byte v = Grid.Get(x, y, z);
                 if (v == AIR || v == waterType.id) continue;
 
                 // only emit top face if nothing is above it
                 int above = y + 1;
-                if (IsInBounds(x, above, z) && voxels[x, above, z] != AIR) break;
+                if (IsInBounds(x, above, z) && Grid.Get(x, above, z) != AIR) break;
 
                 // sand is AllExposed and already renders its own top face — skip overlay
                 if (v != sandType.id)
@@ -263,17 +273,17 @@ public class TerrainGenerator : MonoBehaviour
         for (int z = 0; z < gridSizeZ; z++)
         for (int x = 0; x < gridSizeX; x++)
         {
-            if (voxels[x, y, z] != targetId) continue;
+            if (Grid.Get(x, y, z) != targetId) continue;
 
             // heightScale applies only to the surface block (top exposed to air); body blocks stay full height
-            byte blockAbove = IsInBounds(x, y + 1, z) ? voxels[x, y + 1, z] : AIR;
+            byte blockAbove = IsInBounds(x, y + 1, z) ? Grid.Get(x, y + 1, z) : AIR;
             float hs = (layer.HeightScale < 1f && blockAbove == AIR) ? layer.HeightScale : 1f;
 
             for (int f = 0; f < 6; f++)
             {
                 Vector3Int dir = FaceDirections[f];
                 int nx = x + dir.x, ny = y + dir.y, nz = z + dir.z;
-                byte neighbor = IsInBounds(nx, ny, nz) ? voxels[nx, ny, nz] : AIR;
+                byte neighbor = IsInBounds(nx, ny, nz) ? Grid.Get(nx, ny, nz) : AIR;
 
                 if (layer.ShouldEmitFace(f, neighbor, registry))
                     buf.AddQuad(x, y, z, f, cellSize, hs);
@@ -325,8 +335,8 @@ public class TerrainGenerator : MonoBehaviour
     {
         switch (type)
         {
-            case NOISE_TYPE.SIMPLEX:  return math.remap(-1f, 1f, 0f, 1f, noise.snoise(pos));
-            case NOISE_TYPE.PERLIN:   return math.remap(-1f, 1f, 0f, 1f, noise.cnoise(pos));
+            case NOISE_TYPE.SIMPLEX: return math.remap(-1f, 1f, 0f, 1f, noise.snoise(pos));
+            case NOISE_TYPE.PERLIN: return math.remap(-1f, 1f, 0f, 1f, noise.cnoise(pos));
             case NOISE_TYPE.CELLULAR: return noise.cellular(pos).x;
             default: return 0f;
         }
