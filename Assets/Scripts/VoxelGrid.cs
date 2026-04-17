@@ -39,4 +39,14 @@ public class VoxelGrid
         for (int y = 0; y <= MaxHeight; y++)
             voxels[x, y, z] = AIR;
     }
+
+    // Returns the number of solid blocks in the column (excluding AIR and skipId).
+    // This matches the terrainHeight parameter expected by ApplyColumn.
+    public int GetTerrainHeight(int x, int z, byte skipId)
+    {
+        for (int y = MaxHeight; y >= 0; y--)
+            if (voxels[x, y, z] != AIR && voxels[x, y, z] != skipId)
+                return y + 1;
+        return 1;
+    }
 }
